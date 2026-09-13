@@ -1,0 +1,21 @@
+# Core Deep Learning & Computer Vision
+paddleocr>=2.8.0,<3.0.0
+paddlepaddle>=2.6.0,<3.0.0
+torch>=2.0.0
+torchvision
+transformers>=4.30.0
+
+# Tokenizers & Image Processing
+sentencepiece
+tiktoken
+pillow>=9.0.0
+opencv-python
+
+# Ollama LLM Connection & TTS
+requests
+pyttsx3
+
+# Web UI dependencies
+fastapi
+uvicorn[standard]
+python-multipart

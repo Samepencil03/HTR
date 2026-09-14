@@ -5,6 +5,8 @@ import subprocess
 import time
 
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+# FIX #8: Timeout configurable via env var; reduced default from 180s → 90s
+LLM_TIMEOUT = int(os.environ.get("LLM_TIMEOUT", "90"))
 
 def ensure_ollama_running():
     """
@@ -87,25 +89,33 @@ def query_ollama(prompt: str, model_name: str, system_prompt: str = "") -> str:
     }
 
     try:
-        response = requests.post(url, json=payload, timeout=180)
+        # FIX #8: use configurable LLM_TIMEOUT instead of hardcoded 180 s
+        response = requests.post(url, json=payload, timeout=LLM_TIMEOUT)
         if response.status_code != 200:
             raise RuntimeError(f"Ollama request failed (HTTP {response.status_code}): {response.text}")
         data = response.json()
         return data.get("response", "").strip()
+    except requests.exceptions.Timeout as e:
+        raise RuntimeError(
+            f"Ollama request timed out after {LLM_TIMEOUT}s. "
+            "Try a smaller model or increase LLM_TIMEOUT."
+        ) from e
     except requests.exceptions.RequestException as e:
         raise RuntimeError(f"Ollama connection error: {e}") from e
 
-def correct_text(raw_text: str, model_name: str = None) -> str:
+def correct_text(raw_text: str, model_name: str) -> str:
     """
     Stage A: Correction.
     Fixes obvious HTR/OCR errors (spelling, punctuation, spacing, misread characters)
     without hallucinating facts or altering sentence structure/meaning.
+
+    FIX #9: model_name must be a pre-resolved string (not None).
+    Call process_text_pipeline which resolves the model once for both stages.
     """
     if not raw_text or not raw_text.strip():
         return ""
 
-    model = get_available_model(model_name)
-
+    # FIX #9: model_name is already resolved — no redundant get_available_model call here
     system_prompt = (
         "You are an expert handwriting OCR correction assistant.\n"
         "Your task is to correct spelling, punctuation, spacing, and character recognition errors "
@@ -125,18 +135,19 @@ def correct_text(raw_text: str, model_name: str = None) -> str:
         f"Corrected text:"
     )
 
-    return query_ollama(prompt, model, system_prompt=system_prompt)
+    return query_ollama(prompt, model_name, system_prompt=system_prompt)
 
-def understand_text(corrected_text: str, model_name: str = None) -> str:
+def understand_text(corrected_text: str, model_name: str) -> str:
     """
     Stage B: Understanding.
     Produces a cleaned, polished final representation while preserving original meaning.
+
+    FIX #9: model_name must be a pre-resolved string (not None).
     """
     if not corrected_text or not corrected_text.strip():
         return ""
 
-    model = get_available_model(model_name)
-
+    # FIX #9: model_name is already resolved — no redundant get_available_model call here
     system_prompt = (
         "You are a text understanding and formatting assistant.\n"
         "Format the input text into a clear, clean final representation.\n"
@@ -154,7 +165,7 @@ def understand_text(corrected_text: str, model_name: str = None) -> str:
         f"Final representation:"
     )
 
-    return query_ollama(prompt, model, system_prompt=system_prompt)
+    return query_ollama(prompt, model_name, system_prompt=system_prompt)
 
 def process_text_pipeline(raw_text: str, model_name: str = None, debug: bool = False) -> tuple[str, str]:
     """

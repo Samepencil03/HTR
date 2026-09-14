@@ -4,6 +4,7 @@ import uuid
 import threading
 import glob
 import time
+from PIL import Image as PilImage
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -33,16 +34,49 @@ app.add_middleware(
 TEMP_DIR = "tmp_uploads"
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20 MB — FIX #3
 
+# --- FIX #7: Track model readiness so /health and the UI can report it ---
+_models_ready = False
+
 @app.on_event("startup")
-async def cleanup_temp_on_startup():
-    """Remove any leftover temp files from previous crashed server runs."""
+async def startup_event():
+    """On boot: purge orphaned temp files, then warm up both ML models in a
+    background thread so the first real request is never the one paying cold-start cost."""
+    global _models_ready
+
+    # Cleanup stale uploads from any previous crashed run
     os.makedirs(TEMP_DIR, exist_ok=True)
-    stale_files = glob.glob(os.path.join(TEMP_DIR, "*"))
-    for f in stale_files:
+    for f in glob.glob(os.path.join(TEMP_DIR, "*")):
         try:
             os.remove(f)
         except Exception:
             pass
+
+    # Warm up models in a background thread — server stays responsive during load
+    def _warmup():
+        global _models_ready
+        try:
+            print("[Startup] Warming up PaddleOCR detector...")
+            from detector import get_detector
+            get_detector()  # loads PaddleOCR singleton
+            print("[Startup] Warming up TrOCR recogniser...")
+            from htr import HTRRecognizer
+            HTRRecognizer()._ensure_loaded()  # loads TrOCR singleton
+            print("[Startup] All models ready.")
+        except Exception as e:
+            print(f"[Startup] Model warmup error (non-fatal): {e}")
+        finally:
+            _models_ready = True
+
+    threading.Thread(target=_warmup, daemon=True).start()
+
+
+# --- FIX #7: /health endpoint returns model readiness state ---
+@app.get("/health")
+async def health():
+    return JSONResponse({
+        "status": "ok",
+        "models_ready": _models_ready
+    })
 
 HTML_PAGE = """
 <!DOCTYPE html>
@@ -91,12 +125,23 @@ HTML_PAGE = """
         }
         .preview img { max-width:100%; max-height:300px; object-fit:contain; border-radius: var(--border-radius); }
         .canvas-container { position:relative; }
-        canvas { border:1px solid var(--accent); border-radius: var(--border-radius); background:#fff; }
+        canvas {
+            border:1px solid var(--accent); border-radius: var(--border-radius);
+            background:#fff;
+            /* FIX #11: fill the card width; height set dynamically in JS */
+            width: 100%; display: block;
+        }
         .actions { display:flex; gap:0.5rem; flex-wrap:wrap; }
         button, .actions button { padding:0.5rem 1rem; background: var(--accent); border:none; color: #fff; border-radius: var(--border-radius); cursor:pointer; transition:background 0.2s; }
         button:disabled, .actions button:disabled { background: #555; cursor: not-allowed; }
         button:hover:not(:disabled), .actions button:hover:not(:disabled) { background:#3b5ac4; }
         .result-box { white-space:pre-wrap; background:rgba(0,0,0,0.3); padding:var(--spacing); border-radius: var(--border-radius); max-height:200px; overflow:auto; }
+        /* FIX #7: server status banner */
+        #server-banner {
+            display:none; padding:0.5rem 1rem; border-radius: var(--border-radius);
+            background: rgba(255,193,7,0.15); border: 1px solid #ffc107;
+            color:#ffc107; font-size:0.88rem; text-align:center;
+        }
         @media (max-width: 768px) {
             .flex-row { flex-direction:column; }
         }
@@ -106,6 +151,8 @@ HTML_PAGE = """
 </head>
 <body>
     <div class='container'>
+        <!-- FIX #7: server status banner shown while models are loading -->
+        <div id='server-banner'>⏳ Server is loading AI models for the first time. This may take up to 60 seconds…</div>
         <header>
             <h1>Handwritten Text Recognition</h1>
             <p>Convert handwritten content into clear digital text</p>
@@ -137,7 +184,8 @@ HTML_PAGE = """
             </div>
             <div id='mode-whiteboard' class='mode' style='display:none;'>
                 <div class='canvas-container'>
-                    <canvas id='whiteboard' width='500' height='300'></canvas>
+                    <!-- FIX #11: width/height set dynamically by JS ResizeObserver -->
+                    <canvas id='whiteboard'></canvas>
                 </div>
                 <div class='actions'>
                     <button id='undo-btn'>Undo</button>
@@ -149,7 +197,8 @@ HTML_PAGE = """
                 <button id='recognize-btn' disabled>Recognize Handwriting</button>
             </div>
             <div id='loading' style='display:none; margin-top: var(--spacing);'>
-                <p>⏳ Recognizing...</p>
+                <!-- FIX #8: shows escalating message after 15 s -->
+                <p id='loading-msg'>⏳ Recognizing…</p>
             </div>
             <div id='error-msg' style='color:#ff6b6b; margin-top: var(--spacing); display:none;'></div>
         </div>
@@ -232,6 +281,24 @@ HTML_PAGE = """
         function pushState() { undoStack.push(canvas.toDataURL()); if (undoStack.length>20) undoStack.shift(); }
         canvas.addEventListener('pointerdown', e => { drawing = true; ctx.beginPath(); ctx.moveTo(e.offsetX, e.offsetY); });
         canvas.addEventListener('pointermove', e => { if (!drawing) return; ctx.lineTo(e.offsetX, e.offsetY); ctx.strokeStyle = '#4e70e2'; ctx.lineWidth = 2; ctx.stroke(); });
+        // FIX #11: Responsive canvas — resize to card width, keep 2:1 aspect ratio
+        const canvasContainer = canvas.parentElement;
+        function resizeCanvas() {
+            const newW = canvasContainer.clientWidth || 500;
+            const newH = Math.max(200, Math.round(newW * 0.45));
+            // Preserve existing drawing across resize
+            const snapshot = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            canvas.width = newW;
+            canvas.height = newH;
+            ctx.putImageData(snapshot, 0, 0);
+        }
+        resizeCanvas();
+        if (window.ResizeObserver) {
+            new ResizeObserver(resizeCanvas).observe(canvasContainer);
+        } else {
+            window.addEventListener('resize', resizeCanvas);
+        }
+
         // FIX #5: enable Recognize button as soon as the user lifts the pen after any stroke
         canvas.addEventListener('pointerup', () => { if (drawing) { drawing = false; pushState(); redoStack.length = 0; recognizeBtn.disabled = false; } });
         canvas.addEventListener('pointerout', () => { if (drawing) { drawing = false; pushState(); redoStack.length = 0; } });
@@ -271,20 +338,38 @@ HTML_PAGE = """
             }
         };
         async function sendRequest(formData) {
+            // FIX #8: abort after 120 s with a user-friendly message
+            const controller = new AbortController();
+            const msgTimer = setTimeout(() => {
+                document.getElementById('loading-msg').textContent =
+                    '⏳ Still working… Large images or slow hardware can take a while.';
+            }, 15000);
+            const abortTimer = setTimeout(() => controller.abort(), 120000);
             try {
-                const resp = await fetch('/process', {method:'POST', body:formData});
+                const resp = await fetch('/process', {method:'POST', body:formData, signal: controller.signal});
                 const data = await resp.json();
                 if (resp.ok) {
-                    rawTextDiv.textContent = data.raw_text || '';
-                    finalTextDiv.textContent = data.final_text || '';
-                    resultSection.style.display = 'block';
-                    noResultDiv.style.display = 'none';
+                    if (data.message && !data.raw_text) {
+                        showError(data.message);
+                    } else {
+                        rawTextDiv.textContent = data.raw_text || '';
+                        finalTextDiv.textContent = data.final_text || '';
+                        resultSection.style.display = 'block';
+                        noResultDiv.style.display = 'none';
+                    }
                 } else {
                     showError(data.detail || 'Recognition failed.');
                 }
             } catch (e) {
-                showError('Unable to connect to the recognition server.');
+                if (e.name === 'AbortError') {
+                    showError('Recognition timed out after 2 minutes. Try a smaller image or simpler drawing.');
+                } else {
+                    showError('Unable to connect to the recognition server.');
+                }
             } finally {
+                clearTimeout(msgTimer);
+                clearTimeout(abortTimer);
+                document.getElementById('loading-msg').textContent = '⏳ Recognizing…';
                 loadingDiv.style.display='none';
                 recognizeBtn.disabled = false;
             }
@@ -316,6 +401,18 @@ HTML_PAGE = """
             ctx.clearRect(0,0,canvas.width,canvas.height);
             undoStack.length = 0; redoStack.length = 0;
         }
+        // FIX #7: Poll /health every 3s until models are ready; hide banner once ready
+        (function pollHealth() {
+            const banner = document.getElementById('server-banner');
+            fetch('/health').then(r => r.json()).then(d => {
+                if (!d.models_ready) {
+                    banner.style.display = 'block';
+                    setTimeout(pollHealth, 3000);
+                } else {
+                    banner.style.display = 'none';
+                }
+            }).catch(() => setTimeout(pollHealth, 5000));
+        })();
     </script>
 </body>
 </html>
@@ -354,6 +451,20 @@ async def process_image(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f'Failed to save upload: {e}')
     finally:
         await file.close()
+
+    # --- FIX #6: Validate that the saved bytes are actually a decodable image ---
+    try:
+        with PilImage.open(temp_path) as img:
+            img.verify()  # raises if corrupt or not a real image
+    except Exception:
+        try:
+            os.remove(temp_path)
+        except Exception:
+            pass
+        raise HTTPException(
+            status_code=400,
+            detail='The uploaded file is not a valid image or is corrupted.'
+        )
 
     try:
         # Stage 1: Text detection

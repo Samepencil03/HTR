@@ -1,6 +1,9 @@
 import os
 import shutil
 import uuid
+import threading
+import glob
+import time
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,14 +16,33 @@ from tts import speak
 
 app = FastAPI(title="Handwritten Text Recognition Web UI")
 
-# Allow all origins for local testing (adjust in production)
+# --- FIX #4: CORS — read allowed origins from env var; defaults to localhost only ---
+# Set ALLOWED_ORIGINS="https://yourdomain.com,https://other.com" in production.
+_raw_origins = os.environ.get("ALLOWED_ORIGINS", "http://localhost:8000,http://127.0.0.1:8000")
+ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+# --- FIX #2: Startup cleanup — purge any orphaned tmp_uploads files from crashed runs ---
+TEMP_DIR = "tmp_uploads"
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20 MB — FIX #3
+
+@app.on_event("startup")
+async def cleanup_temp_on_startup():
+    """Remove any leftover temp files from previous crashed server runs."""
+    os.makedirs(TEMP_DIR, exist_ok=True)
+    stale_files = glob.glob(os.path.join(TEMP_DIR, "*"))
+    for f in stale_files:
+        try:
+            os.remove(f)
+        except Exception:
+            pass
 
 HTML_PAGE = """
 <!DOCTYPE html>
@@ -210,7 +232,8 @@ HTML_PAGE = """
         function pushState() { undoStack.push(canvas.toDataURL()); if (undoStack.length>20) undoStack.shift(); }
         canvas.addEventListener('pointerdown', e => { drawing = true; ctx.beginPath(); ctx.moveTo(e.offsetX, e.offsetY); });
         canvas.addEventListener('pointermove', e => { if (!drawing) return; ctx.lineTo(e.offsetX, e.offsetY); ctx.strokeStyle = '#4e70e2'; ctx.lineWidth = 2; ctx.stroke(); });
-        canvas.addEventListener('pointerup', () => { if (drawing) { drawing = false; pushState(); redoStack.length = 0; } });
+        // FIX #5: enable Recognize button as soon as the user lifts the pen after any stroke
+        canvas.addEventListener('pointerup', () => { if (drawing) { drawing = false; pushState(); redoStack.length = 0; recognizeBtn.disabled = false; } });
         canvas.addEventListener('pointerout', () => { if (drawing) { drawing = false; pushState(); redoStack.length = 0; } });
         document.getElementById('clear-canvas-btn').onclick = () => { ctx.clearRect(0,0,canvas.width,canvas.height); pushState(); };
         document.getElementById('undo-btn').onclick = () => {
@@ -307,13 +330,26 @@ async def process_image(file: UploadFile = File(...)):
     # Validate mime type (basic check)
     if not file.content_type.startswith('image/'):
         raise HTTPException(status_code=400, detail='Uploaded file is not an image')
-    # Save to a temporary location
-    temp_dir = 'tmp_uploads'
-    os.makedirs(temp_dir, exist_ok=True)
-    temp_path = os.path.join(temp_dir, f"{uuid.uuid4().hex}_{file.filename}")
+
+    # --- FIX #3: Enforce 20 MB file size limit via streaming byte counter ---
+    os.makedirs(TEMP_DIR, exist_ok=True)
+    temp_path = os.path.join(TEMP_DIR, f"{uuid.uuid4().hex}_{file.filename}")
+    total_bytes = 0
     try:
         with open(temp_path, 'wb') as out_file:
-            shutil.copyfileobj(file.file, out_file)
+            while True:
+                chunk = await file.read(65536)  # read in 64 KB chunks
+                if not chunk:
+                    break
+                total_bytes += len(chunk)
+                if total_bytes > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f'File too large. Maximum allowed size is {MAX_UPLOAD_BYTES // (1024*1024)} MB.'
+                    )
+                out_file.write(chunk)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f'Failed to save upload: {e}')
     finally:
@@ -322,8 +358,18 @@ async def process_image(file: UploadFile = File(...)):
     try:
         # Stage 1: Text detection
         detected_regions = detect_text(temp_path, debug=False)
+
+        # --- FIX #17 (bonus): return proper 200 JSON instead of HTTPException(200) ---
         if not detected_regions:
-            raise HTTPException(status_code=200, detail='No text regions detected')
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "raw_text": "",
+                    "final_text": "",
+                    "message": "No text regions were detected in the image."
+                }
+            )
+
         # Stage 2: Handwritten Text Recognition
         raw_lines = []
         for region in detected_regions:
@@ -332,21 +378,29 @@ async def process_image(file: UploadFile = File(...)):
             if line_text:
                 raw_lines.append(line_text)
         raw_text = '\n'.join(raw_lines)
+
         # Stage 3: LLM correction & understanding
         corrected_text, final_text = process_text_pipeline(raw_text, model_name=None, debug=False)
-        # Optional: Speak the final text (non‑blocking)
-        try:
-            speak(final_text)
-        except Exception:
-            pass
+
+        # --- FIX #1: Run TTS in a background thread so it never blocks the HTTP response ---
+        def _speak_background(text: str):
+            try:
+                speak(text)
+            except Exception:
+                pass
+
+        if final_text:
+            threading.Thread(target=_speak_background, args=(final_text,), daemon=True).start()
+
         return JSONResponse(content={"raw_text": raw_text, "final_text": final_text})
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        # Clean up temporary file
+        # --- FIX #2 (per-request): Always delete the temp file when done ---
         try:
-            os.remove(temp_path)
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
         except Exception:
             pass

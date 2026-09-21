@@ -1,165 +1,191 @@
-# End-to-End Handwritten Text Recognition (HTR) Pipeline
+# End-to-End Handwritten Text Recognition (HTR) Pipeline & Web Dashboard
 
-An end-to-end modular handwritten text recognition pipeline built with Python. It accepts handwritten document images, detects line regions, transcribes handwriting with TrOCR, cleans and understands the text using a local Gemma model via Ollama, and converts the final text into spoken speech with TTS.
+An end-to-end, modular handwritten text recognition (HTR) pipeline and interactive web dashboard. It processes handwritten document images, detects and merges text line regions using PaddleOCR, transcribes handwriting in batch using Hugging Face TrOCR, corrects and cleans the transcriptions using a local Gemma LLM via Ollama, and synthesizes spoken speech output (`output/speech.wav`).
 
 ---
 
-## 🏗️ Architecture
+## 🏗️ Architecture & Pipeline Flow
 
 ```
-IMAGE FILE
-    │
-    ▼
+HANDWRITTEN IMAGE
+       │
+       ▼
 [1/5] PaddleOCR Text Detection (detector.py)
-    │  - Detects bounding box regions
-    │  - Sorts boxes top-to-bottom, left-to-right (reading order)
-    │  - Saves text line crops to crops/ (in --debug mode)
-    ▼
-[2/5] Handwritten Text Recognition (htr.py)
-    │  - TrOCR Model (microsoft/trocr-base-handwritten)
-    │  - Transcribes each line crop in reading order
-    ▼
+       │  - Detects text bounding boxes
+       │  - Clusters adjacent word boxes into continuous text lines
+       │  - Applies dynamic padding (8% edge margin) to prevent letter clipping
+       │  - Sorts line crops in natural reading order (top-to-bottom, left-to-right)
+       ▼
+[2/5] Batch Handwritten Text Recognition (htr.py)
+       │  - TrOCR Model (microsoft/trocr-base-handwritten)
+       │  - Processes cropped line images in a single parallel batch pass
+       ▼
 [3/5] Raw Text Assembly (main.py)
-    │  - Joins line transcriptions preserving line breaks (\n)
-    ▼
+       │  - Joins line transcriptions preserving line breaks (\n)
+       ▼
 [4/5] Local Gemma LLM Processing (llm.py)
-    │  ├─ Stage A: Correction (Fixes OCR typos & punctuation without changing meaning)
-    │  └─ Stage B: Understanding (Cleans and formats output without hallucination)
-    ▼
-[5/5] Text-To-Speech & Output (tts.py & output/result.txt)
-    │  - Speaks final text via pyttsx3 / espeak-ng / spd-say
-    │  - Saves output to output/result.txt
+       │  ├─ Stage A: Correction (Fixes OCR typos & punctuation without changing meaning)
+       │  └─ Stage B: Understanding (Cleans and formats output into final representation)
+       ▼
+[5/5] Text-To-Speech & Export (tts.py & output/)
+       │  - Synthesizes speech via pyttsx3 (SAPI5 on Windows, espeak-ng on Linux/macOS)
+       │  - Saves transcript to output/result.txt
+       │  - Exports audio speech file to output/speech.wav
 ```
 
 ---
 
-## 📋 Prerequisites
+## 🌟 Key Features
 
-Before running the pipeline, ensure your system has:
-
-1. **Python 3.9 – 3.12**
-2. **Ollama** installed on your system ([https://ollama.com](https://ollama.com))
-3. *(Optional for Linux Audio)* System speech synthesis engine (`espeak-ng` or `espeak`):
-   ```bash
-   sudo apt-get update && sudo apt-get install -y espeak-ng
-   ```
+- **Cross-Platform**: Fully compatible with **Windows**, **Linux**, and **macOS**.
+- **Text Line Merging**: Automatically combines word bounding boxes into full text lines for optimal TrOCR recognition accuracy.
+- **Batch Recognition**: Processes multi-line document crops in parallel using Hugging Face TrOCR.
+- **Local LLM Post-Processing**: Automatically connects to Ollama, auto-detects local Gemma models (`gemma2:2b`, `gemma3:4b`), and performs text correction and understanding.
+- **WAV Speech Export**: Generates an audio speech file (`output/speech.wav`) alongside live browser audio playback.
+- **Interactive Web Dashboard (FastAPI)**: Features real-time pipeline metrics, live speech player, visual bounding box overlays, line crops gallery, and an interactive drawing whiteboard.
 
 ---
 
-## 🚀 Step-by-Step Installation
+## 📋 Prerequisites & System Requirements
 
-### 1. Clone or Open the Repository
+- **Python**: 3.9 – 3.12 installed on your system.
+- **Ollama**: Installed locally ([https://ollama.com](https://ollama.com)) with a Gemma model pulled (`ollama pull gemma2:2b`).
+- **System Audio Engine (TTS)**:
+  - **Windows**: Built-in Windows SAPI5 (no additional installation required).
+  - **Linux**: Requires `espeak-ng` or `espeak`:
+    ```bash
+    sudo apt-get update && sudo apt-get install -y espeak-ng
+    ```
+  - **macOS**: Built-in speech engine / `espeak`.
+
+---
+
+## 🚀 Installation & Quick Start
+
+### 1. Clone the Repository
 ```bash
-cd paddleocr-test
+git clone https://github.com/Samepencil03/HTR.git
+cd HTR
 ```
 
 ### 2. Create and Activate Virtual Environment
+
+#### 🐧 Linux & 🍎 macOS:
 ```bash
 python3 -m venv venv
 source venv/bin/activate
 ```
 
-### 3. Install Dependencies
+#### 🪟 Windows (Command Prompt `cmd.exe`):
+```cmd
+python -m venv venv
+venv\Scripts\activate
+```
+
+#### 🪟 Windows (PowerShell):
+```powershell
+python -m venv venv
+.\venv\Scripts\Activate.ps1
+```
+
+### 3. Install Python Dependencies
 ```bash
 pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### 4. Start Ollama and Pull a Gemma Model
-Ensure the Ollama server is running and download a local Gemma model:
+---
+
+## 🤖 Ollama & LLM Setup
+
+Install Ollama for your operating system:
+- **Linux**: `curl -fsSL https://ollama.com/install.sh | sh`
+- **Windows**: Download installer from [ollama.com/download/windows](https://ollama.com/download/windows)
+- **macOS**: Download installer from [ollama.com/download/mac](https://ollama.com/download/mac)
+
+Start the Ollama server and pull the Gemma model:
 ```bash
-ollama serve &
+# Start server (if not running as a background service)
+ollama serve
+
+# Pull local Gemma model (in another terminal)
 ollama pull gemma2:2b
 ```
 
 ---
 
-## 💡 How to Run the Program
+## 💻 Running via Command Line (CLI)
 
-### Basic Command
-Run the pipeline on any image containing handwritten text:
-```bash
-python main.py /path/to/handwritten_image.png
-```
+Run the end-to-end pipeline on any handwritten image file:
 
-### Debug Mode (`--debug`)
-Save line crops to `crops/`, generate bounding box overlay image to `output/detected_boxes.png`, and view detailed step-by-step logs:
+#### Linux / macOS:
 ```bash
-python main.py input/sample_handwritten.png --debug
-```
-
-### Custom Model (`--model`)
-Specify a specific local Gemma or Ollama model name:
-```bash
-python main.py input/sample_handwritten.png --model gemma2:2b
-```
-Or set the environment variable:
-```bash
-export GEMMA_MODEL=gemma2:2b
 python main.py input/sample_handwritten.png
 ```
 
----
-
-## 📁 Output Files
-
-When execution completes, outputs are saved in the `output/` directory:
-
-- **Final Processed Text**: `output/result.txt`
-- **Detected Bounding Boxes Visualization (Debug Mode)**: `output/detected_boxes.png`
-- **Individual Line Crops (Debug Mode)**: `crops/crop_000.png`, `crops/crop_001.png`, ...
-
----
-
-## 📂 Project Structure
-
-```
-.
-├── main.py                # Main pipeline orchestrator (stages 1 to 5)
-├── detector.py            # PaddleOCR text detection & reading-order sorting
-├── htr.py                 # Dedicated TrOCR handwriting recognition model
-├── llm.py                 # Ollama connection & 2-stage LLM correction/understanding
-├── tts.py                 # Offline Linux text-to-speech engine
-├── create_sample_image.py # Helper script to generate a test image
-├── requirements.txt       # Python dependencies list
-├── README.md              # Project documentation
-├── input/                 # Directory for input images
-├── output/                # Directory for output result.txt & visualizations
-├── crops/                 # Directory for temporary text line crops (debug mode)
-├── web_ui.py              # FastAPI web interface
-└── tmp_uploads/           # Temporary upload folder (runtime)
+#### Windows:
+```cmd
+python main.py input\sample_handwritten.png
 ```
 
+### Command Flags:
+- **Debug Mode (`--debug`)**: Saves cropped line images to `crops/`, draws bounding box overlays to `output/detected_boxes.png`, and logs step-by-step debug information.
+  ```bash
+  python main.py input/sample_handwritten.png --debug
+  ```
+- **Custom Model (`--model`)**: Specify a custom local Ollama model.
+  ```bash
+  python main.py input/sample_handwritten.png --model gemma2:2b
+  ```
+
 ---
 
-## 🌐 Web Interface (FastAPI)
+## 🌐 Interactive Web Dashboard (FastAPI)
 
-A lightweight web UI is provided to run the pipeline without using the terminal.
+Launch the FastAPI web server:
 
-### Additional Dependencies
-The web UI requires a few extra packages. Install them with:
 ```bash
-pip install fastapi uvicorn python-multipart
+python -m uvicorn web_ui:app --host 0.0.0.0 --port 8000
 ```
 
-### Running the Server
-Start the FastAPI server using **uvicorn**:
-```bash
-uvicorn web_ui:app --host 0.0.0.0 --port 8000
-```
-The server will be accessible at `http://localhost:8000`. Open this URL in a browser, upload an image, and the page will display the raw and final text results.
+Open your browser and navigate to:
+**[http://localhost:8000](http://localhost:8000)**
 
-### Endpoints
-- `GET /` – Serves the HTML upload page.
-- `POST /process` – Accepts an image file, runs the full pipeline, and returns JSON with `raw_text` and `final_text`.
+### Dashboard Features:
+1. **Interactive Canvas / Whiteboard**: Draw handwritten text directly on the canvas or upload images (`.png`, `.jpg`, `.jpeg`, `.webp`).
+2. **Real-Time Metrics**: View detected line counts, overall processing duration, active HTR model, and Gemma LLM model.
+3. **Visual Overlays & Crop Gallery**: Inspect detected text line bounding box visualizations and view individual cropped line segments.
+4. **Built-in Speech Player**: Listen to synthesized speech directly in your browser or download the `.wav` audio file.
 
 ---
 
-## 🔧 Troubleshooting
+## 🔗 REST API Endpoints
 
-- **Ollama server connection error**:
-  Ensure Ollama is running by executing `ollama serve` in a terminal window.
-- **Model memory limit error**:
-  If a model is too large for system RAM, pull a smaller model such as `ollama pull gemma2:2b` or `ollama pull qwen2.5:0.5b` and pass `--model gemma2:2b`.
-- **No text-to-speech audio**:
-  If running on a headless server without audio hardware, the pipeline will log a notice and still output the full text result cleanly to `output/result.txt`.
+| Endpoint | Method | Description |
+| :--- | :--- | :--- |
+| `GET /` | GET | Renders the full interactive web dashboard HTML interface. |
+| `POST /process` | POST | Uploads an image file (`multipart/form-data`) and runs detection, TrOCR recognition, Gemma LLM cleanup, and TTS speech synthesis. Returns JSON with raw text, final text, metrics, and base64 images. |
+| `GET /health` | GET | Returns server status and model warmup readiness (`{"status": "ok", "models_ready": true}`). |
+| `GET /audio` | GET | Downloads or streams the generated WAV speech output (`output/speech.wav`). |
+
+---
+
+## 📁 Output Artifacts
+
+All pipeline outputs are automatically saved to the following directories:
+
+- **Text Output**: `output/result.txt` (Contains both raw TrOCR transcription and final Gemma LLM text)
+- **Speech Audio**: `output/speech.wav` (Synthesized audio file)
+- **Bounding Box Visualization**: `output/detected_boxes.png` (Visual overlay showing merged text lines)
+- **Line Crops**: `crops/crop_000.png`, `crops/crop_001.png`, ... (Cropped text line images)
+
+---
+
+## 🛠️ Troubleshooting
+
+- **PyTorch Memory / Install Issues**: Install CPU-only PyTorch if GPU memory or space is limited:
+  ```bash
+  pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+  ```
+- **Ollama Connection Warning**: Ensure `ollama serve` is running on `http://localhost:11434`.
+- **TTS Audio Errors on Linux**: Install `espeak-ng` (`sudo apt install espeak-ng`). On Windows, pyttsx3 uses native Windows SAPI5 automatically.

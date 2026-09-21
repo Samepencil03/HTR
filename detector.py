@@ -13,7 +13,6 @@ def get_detector():
     if _detector_instance is None:
         try:
             from paddleocr import PaddleOCR
-            # Initialize PaddleOCR detector instance with english language
             _detector_instance = PaddleOCR(
                 lang="en",
                 show_log=False
@@ -26,10 +25,11 @@ def get_detector():
                 raise RuntimeError(f"PaddleOCR initialization failure: {e2}") from e
     return _detector_instance
 
-def sort_reading_order(boxes_and_polys):
+def sort_reading_order(boxes_and_polys, merge_horizontal: bool = True):
     """
     Sort bounding boxes top-to-bottom, left-to-right to preserve original reading order.
-    Grouping algorithm clusters boxes into horizontal text lines using vertical centroid distance.
+    Clusters boxes into horizontal text lines using vertical centroid distance.
+    Merges adjacent word bounding boxes in the same line to form complete text-line crops for TrOCR.
     """
     if not boxes_and_polys:
         return []
@@ -59,19 +59,45 @@ def sort_reading_order(boxes_and_polys):
         if not placed:
             lines.append([item])
 
-    # Sort lines top-to-bottom, and items within lines left-to-right
+    # Sort lines top-to-bottom
     lines.sort(key=lambda line: float(np.mean([x['box'][1] for x in line])))
 
-    sorted_items = []
+    merged_items = []
     for line in lines:
         line.sort(key=lambda x: x['box'][0])
-        sorted_items.extend(line)
 
-    return sorted_items
+        if not merge_horizontal or len(line) <= 1:
+            merged_items.extend(line)
+            continue
 
-def detect_text(image_path: str, debug: bool = False):
+        line_avg_h = float(np.mean([x['h'] for x in line]))
+        max_gap = max(15.0, line_avg_h * 1.5)
+
+        curr = line[0]
+        for next_item in line[1:]:
+            c_xmin, c_ymin, c_xmax, c_ymax = curr['box']
+            n_xmin, n_ymin, n_xmax, n_ymax = next_item['box']
+
+            gap = n_xmin - c_xmax
+            if gap <= max_gap:
+                m_xmin = min(c_xmin, n_xmin)
+                m_ymin = min(c_ymin, n_ymin)
+                m_xmax = max(c_xmax, n_xmax)
+                m_ymax = max(c_ymax, n_ymax)
+                curr['box'] = [m_xmin, m_ymin, m_xmax, m_ymax]
+                curr['h'] = m_ymax - m_ymin
+                curr['cy'] = (m_ymin + m_ymax) / 2.0
+            else:
+                merged_items.append(curr)
+                curr = next_item
+        merged_items.append(curr)
+
+    return merged_items
+
+def detect_text(image_path: str, debug: bool = False, merge_lines: bool = True):
     """
     Detect text regions in an image using PaddleOCR (detection mode only).
+    Merges word boxes into full text lines and applies dynamic padding for HTR line recognition.
     
     Returns a list of dicts:
     [
@@ -96,7 +122,6 @@ def detect_text(image_path: str, debug: bool = False):
 
     raw_polys = []
     try:
-        # Run PaddleOCR in detection-only mode (det=True, rec=False)
         ocr_res = detector.ocr(image_path, det=True, rec=False)
         if ocr_res and isinstance(ocr_res, list):
             if len(ocr_res) > 0 and isinstance(ocr_res[0], list):
@@ -112,7 +137,6 @@ def detect_text(image_path: str, debug: bool = False):
             print(f"[DEBUG Detector] Primary det=True OCR call encountered issue: {e}")
         raw_polys = []
 
-    # Fallback parsing if predict interface is used by newer PaddleOCR/Paddlex APIs
     if not raw_polys:
         try:
             results = detector.predict(image_path)
@@ -140,15 +164,14 @@ def detect_text(image_path: str, debug: bool = False):
         xmax = min(img_w, int(np.max(pts[:, 0])))
         ymax = min(img_h, int(np.max(pts[:, 1])))
 
-        # Ensure box is valid (non-zero area)
         if xmax > xmin + 2 and ymax > ymin + 2:
             extracted.append({
                 'box': [xmin, ymin, xmax, ymax],
                 'poly': pts
             })
 
-    # Sort boxes into standard reading order (top-to-bottom, left-to-right)
-    sorted_regions = sort_reading_order(extracted)
+    # Sort and merge boxes into full text lines in reading order
+    sorted_regions = sort_reading_order(extracted, merge_horizontal=merge_lines)
 
     crops_dir = "crops"
     output_dir = "output"
@@ -161,12 +184,17 @@ def detect_text(image_path: str, debug: bool = False):
     results = []
     for idx, item in enumerate(sorted_regions):
         xmin, ymin, xmax, ymax = item['box']
-        # Add slight padding around box for cleaner text crop
-        pad = 2
-        p_xmin = max(0, xmin - pad)
-        p_ymin = max(0, ymin - pad)
-        p_xmax = min(img_w, xmax + pad)
-        p_ymax = min(img_h, ymax + pad)
+        box_h = ymax - ymin
+        box_w = xmax - xmin
+        
+        # Dynamic padding to avoid clipping letter edges
+        pad_h = max(4, int(0.08 * box_h))
+        pad_w = max(4, int(0.08 * box_w))
+        
+        p_xmin = max(0, xmin - pad_w)
+        p_ymin = max(0, ymin - pad_h)
+        p_xmax = min(img_w, xmax + pad_w)
+        p_ymax = min(img_h, ymax + pad_h)
 
         crop = pil_img.crop((p_xmin, p_ymin, p_xmax, p_ymax))
 
